@@ -1,0 +1,457 @@
+// guardmodule.v1 — the interface between AgentsGuard's endpoint daemon and an external
+// prompt/content-decision module ("the Module").
+//
+// Direction: the AgentsGuard daemon is the gRPC CLIENT. The Module is the SERVER.
+// The Module never calls the Daemon.
+//
+// Deployment: both processes run on the SAME endpoint. They talk over a Unix domain
+// socket. There is no remote deployment mode.
+//
+// Lifecycle: the DAEMON owns it. The Daemon spawns the Module when an operator turns a
+// port on, supervises it, and terminates it when the port is turned off. The Module does
+// not daemonize, does not fork, and does not survive the Daemon. See spec section 2.
+//
+// Division of responsibility:
+//   The Daemon decides WHAT to inspect and WHAT a denial does to the agent. It owns the
+//   capability token, the five P1 checks, the enforcement posture, and the operator's
+//   error text. The Module decides only whether a piece of text is safe.
+//
+// Two service surfaces:
+//   GuardModule      — the decision path. Latency-critical. See spec sections 5 to 7.
+//   GuardModuleAdmin — configuration and introspection. The Daemon proxies these calls
+//                      from the operator console. Not latency-critical. Section 9.
+//
+// Every action enum in this file defines 0 (UNSPECIFIED) as DENY. A message that omits
+// the field therefore fails closed. Do not add an enum with a permissive zero value.
+//
+// Compatibility: field numbers are permanent. Never renumber them. Never reuse them.
+// Every new field is optional. ModuleCapabilities gates every new behaviour.
+//
+// Style: `buf lint` reports this file against its default rules (a "Service" suffix on
+// service names, a "…Response" suffix on response messages). Those findings are expected
+// and are not defects. netguard.v1 reports the same ones. The names here favour reading
+// as an interface document over satisfying a linter default.
+//
+// Authentication is DEFERRED. This revision specifies no peer authentication on the
+// socket. It will be specified separately, before any production deployment. Until then
+// the socket's directory permissions are the only control.
+
+syntax = "proto3";
+
+package guardmodule.v1;
+
+// Advisory only. Override it for your own module layout. Delete it if you do not
+// generate Go. It does not change the wire format.
+option go_package = "guardmodule/gen/guardmodule/v1;guardmodulev1";
+
+// ============================================================================
+// Common
+// ============================================================================
+
+// GuardContext identifies the agent activity behind an inspection.
+//
+// TRUST: the Daemon fills every field from attested internal state. No field comes from
+// the agent's environment, arguments, or content. Treat these fields as trusted. Any
+// future field that comes from the agent will carry a `claimed_` prefix in its name.
+message GuardContext {
+  // agent_id is the attested workload identity, in the form
+  // spiffe://<trust-domain>/agent/<agent-class>/<session-id>.
+  //
+  // It MAY be empty. Identity resolution is best-effort context, not a gate: a session
+  // whose token cannot be resolved still gets inspected. An empty agent_id MUST NOT by
+  // itself cause a deny.
+  string agent_id = 1;
+
+  // agent_class is the runtime family, for example "claude-code". Derived from
+  // agent_id; carried separately so you do not parse the URI.
+  string agent_class = 2;
+
+  // session_id is the agent session UUID. Stable for the life of one session. Use it to
+  // correlate calls; do NOT use it to carry state between calls (see section 10.7).
+  string session_id = 3;
+
+  // cwd is the session's working directory. It is the directory the operator's policy
+  // matched, so it is the best available answer to "which project is this?".
+  string cwd = 4;
+
+  // matched_profile is the name of the capability profile governing this session, for
+  // example "go-dev". Advisory context. Do not treat it as a permission.
+  string matched_profile = 5;
+}
+
+// GuardAction is the verdict. Zero is DENY, so an omitted action fails closed.
+enum GuardAction {
+  GUARD_ACTION_UNSPECIFIED = 0;
+  GUARD_ACTION_ALLOW       = 1;
+  GUARD_ACTION_DENY        = 2;
+}
+
+// VerdictInfo carries the human and machine explanation of a verdict. Populate it on
+// every DENY. It is optional on an ALLOW, and useful there: an allow with labels is how
+// an operator sees that the Module ran and found nothing.
+message VerdictInfo {
+  // reason explains the decision in one sentence.
+  //
+  // On a DENY it is REQUIRED. It reaches the operator's event log, and for
+  // CheckTranscript it also reaches the model (see TranscriptVerdict).
+  //
+  // Write it as plain prose. Unlike the stdio plugin contract this interface replaces,
+  // NO reason prefix is reserved: a transport error and a verdict travel on different
+  // channels here, so the Daemon never has to read your text to tell them apart.
+  string reason = 1;
+
+  // labels are flat metadata for the operator's event log and console.
+  //
+  // The Daemon bounds them: at most 16 entries, keys of at most 64 bytes matching
+  // [a-z0-9_.-]+, values of at most 256 bytes. Keys are sorted before truncation.
+  //
+  // Key names are also subject to the Daemon's redaction pass, which DROPS any key
+  // containing auth, cred, token, secret, session, cookie, bearer, password or apikey.
+  // "credential_hit" therefore disappears. Use rule, finding, pattern, score, detector.
+  map<string, string> labels = 2;
+
+  // rule_id identifies the specific rule that fired, in your own vocabulary. The console
+  // shows it. Leave it empty when no discrete rule applies (for example a model verdict).
+  string rule_id = 3;
+
+  // ruleset_id identifies the ruleset that produced this verdict. It SHOULD match the
+  // value Health reports. The Daemon records it with the decision, so an operator can
+  // answer "which rules were live when the Module blocked this?".
+  string ruleset_id = 4;
+
+  // confidence is an optional 0..1 score for a probabilistic detector. The console shows
+  // it when non-zero. A deterministic rule SHOULD leave it at 0 rather than send 1.
+  float confidence = 5;
+}
+
+// ============================================================================
+// Decision path — the four checks
+// ============================================================================
+//
+// Each check is a separate RPC because the inputs differ. ModuleCapabilities declares
+// which ones you implement; the Daemon does not call the others, so a Module that only
+// screens prompts declares two and is never asked about tool content.
+
+// CheckPromptRequest carries the user's prompt, before the agent acts on it.
+message CheckPromptRequest {
+  GuardContext ctx = 1;
+
+  // prompt is the user's raw text, exactly as typed. The Daemon does not redact it and
+  // does not store it.
+  string prompt = 2;
+}
+
+message PromptVerdict {
+  GuardAction action = 1;
+  VerdictInfo info   = 2;
+
+  // additional_context is injected alongside the prompt when the action is ALLOW. The
+  // MODEL reads it; the user does not see it.
+  //
+  // This is the steering path: you annotate a risky-but-legitimate prompt instead of
+  // refusing it. For example "This prompt refers to credentials. Do not read key
+  // material."
+  //
+  // It is IGNORED on a DENY, and ignored by every other check.
+  string additional_context = 3;
+}
+
+// CheckTranscriptRequest carries the agent's own record of a completed turn.
+//
+// WHAT IT CONTAINS, and what it does not. The transcript is JSONL and holds the agent's
+// VISIBLE output (`text` blocks), every tool call it made with full arguments
+// (`tool_use`), the results those tools returned, and the user's messages.
+//
+// It does NOT contain the model's reasoning. Claude Code writes `thinking` blocks with an
+// empty `thinking` string and a `signature` only — measured across six transcripts from
+// four projects, 2026-07-15 to 2026-08-13: 0 of 4083 blocks carried text. Do not build a
+// detector that expects to read the model's chain of thought here. It is not present.
+//
+// What you get is therefore post-hoc BEHAVIOURAL review: what the agent said it would do,
+// and what it actually did. That is still the strongest signal in the interface, because
+// a tool call is a fact rather than an intention.
+//
+// If you want the agent's plan in words, ask for it: PromptVerdict.additional_context can
+// instruct the model to state its plan before acting, and that text lands in a `text`
+// block, which this check does see.
+message CheckTranscriptRequest {
+  GuardContext ctx = 1;
+
+  // transcript_path is an absolute path to a JSONL file, one JSON object per line. It is
+  // always set. The Module reads the file itself, with the Daemon's privileges.
+  string transcript_path = 2;
+
+  // transcript_tail carries the bytes the Daemon read on your behalf. It is present only
+  // when you declared max_transcript_bytes > 0, and holds at most that many bytes from
+  // the END of the file.
+  //
+  // Declaring it is the safer choice: the Module then never opens a user's file, which
+  // removes the Module from that data-governance boundary entirely.
+  bytes transcript_tail = 3;
+
+  // transcript_tail_truncated is true when the file was larger than the bytes supplied.
+  bool transcript_tail_truncated = 4;
+
+  // turn_index counts the turns inspected in this session, from 1. A Module that wants
+  // to escalate on repetition can use it.
+  //
+  // NOTE: you will NOT see a re-inspection of the same turn after your DENY. The Daemon
+  // suppresses that (the runtime re-invokes its stop hook, and the Daemon answers it
+  // without calling you), because a transcript only grows and the text that triggered
+  // your deny is still in it. Do not write rules that assume the content changed.
+  uint32 turn_index = 5;
+}
+
+message TranscriptVerdict {
+  GuardAction action = 1;
+
+  // info.reason on a DENY is CORRECTIVE FEEDBACK TO THE MODEL, not a note to a human.
+  // The turn is force-continued and this text is injected into the agent's next turn.
+  //
+  // Write it as an instruction. For example: "Your plan disables the audit log. Do not
+  // change security controls. Explain why you believe it is necessary and ask the
+  // operator to decide."
+  VerdictInfo info = 2;
+}
+
+// CheckToolInputRequest carries a tool call before it runs. This is the model-outbound
+// direction: what the agent is about to do.
+message CheckToolInputRequest {
+  GuardContext ctx = 1;
+
+  // tool_name is the runtime's own name for the tool, for example "Bash" or "WebFetch".
+  // It is NOT a capability-scope tool name.
+  string tool_name = 2;
+
+  // tool_input_json is the tool's arguments as raw JSON text. Its shape belongs to the
+  // runtime, not to AgentsGuard. Parse defensively.
+  string tool_input_json = 3;
+}
+
+// CheckToolOutputRequest carries what a tool returned, before the model reads it. This is
+// the model-INBOUND direction, and it is where prompt injection actually arrives: in a
+// fetched page or a read file, not in what the user typed.
+message CheckToolOutputRequest {
+  GuardContext ctx = 1;
+
+  string tool_name = 2;
+
+  // tool_output is the raw output. The Daemon truncates it to max_tool_output_bytes.
+  bytes tool_output = 3;
+
+  // tool_output_truncated is true when the output was larger than the bytes supplied.
+  // A Module that must see the whole body MUST deny when this is true rather than judge
+  // a fragment.
+  bool tool_output_truncated = 4;
+}
+
+// A CheckEgress RPC was specified in an earlier draft and REMOVED before release.
+//
+// It decided one outbound connection from the destination alone. That is exactly
+// netguard.v1's CheckFlow at CHECK_STAGE_CONNECT: same trigger, same effect, and NetGuard
+// carries strictly more — sni, resolved_ips and protocol as well as host, port and the
+// network class. Two modules able to veto one CONNECT is also an operational problem: the
+// operator cannot tell which of them refused it.
+//
+// The network belongs to NetGuard. This interface stops at the boundary of the model's
+// own language: prompts, reasoning, and the content tools carry in and out.
+
+// The two content checks each return their own verdict message. The shapes are identical
+// today: neither can steer the agent, only permit or refuse.
+//
+// They are separate types on purpose. A shared message would couple the RPCs, so a field
+// that only tool-output inspection needs would appear on tool-input verdicts too and could
+// never be removed. Field numbers are permanent, so this is the one decision that cannot
+// be undone later.
+message ToolInputVerdict {
+  GuardAction action = 1;
+  VerdictInfo info   = 2;
+}
+
+message ToolOutputVerdict {
+  GuardAction action = 1;
+  VerdictInfo info   = 2;
+}
+
+// ============================================================================
+// Health and capabilities
+// ============================================================================
+
+// ModuleCapabilities declares what the Module does. The Daemon calls only the checks you
+// declare, and sizes the payloads you asked for.
+//
+// Declaring less is not a weakness. A Module that handles prompts and transcripts and
+// declares no content checks is a complete, useful prompt guard, and it costs the endpoint
+// nothing on every network connection.
+message ModuleCapabilities {
+  // Each flag gates one decision RPC. When a flag is false the Daemon never calls that
+  // RPC, and the corresponding inspection does not happen — it is NOT denied.
+  bool check_prompt      = 1;
+  bool check_transcript  = 2;
+  bool check_tool_input  = 3;
+  bool check_tool_output = 4;
+
+  // 5 held check_egress, removed before release: netguard.v1's CheckFlow at
+  // CHECK_STAGE_CONNECT already decides one outbound connection, with more context.
+  // Do not reuse the number.
+  reserved 5;
+
+  // max_tool_output_bytes is the largest tool_output you want. 0 means "send none": you
+  // then receive tool_name only, which is a valid and much cheaper configuration.
+  uint32 max_tool_output_bytes = 6;
+
+  // max_transcript_bytes is the largest transcript_tail you want, counted from the end of
+  // the file. 0 means "send none, I will open the path myself".
+  //
+  // Prefer a non-zero value. The Module then never reads a user's transcript directly.
+  uint32 max_transcript_bytes = 7;
+
+  // max_concurrent_checks is the number of decision RPCs you can absorb at once without
+  // a queue. 0 means "use the Daemon's default". The Daemon SHOULD respect the value.
+  // You MUST still work correctly if it sends more.
+  uint32 max_concurrent_checks = 8;
+
+  // admin advertises the GuardModuleAdmin service. When false, the console shows the
+  // Module as present but the operator cannot configure it through AgentsGuard.
+  bool admin = 9;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  // ready is false while the Module runs but cannot yet decide. Loading a model or a
+  // ruleset at startup is the normal cause, and the Daemon expects it: see the startup
+  // grace in spec section 2.4.
+  //
+  // Report ready=false honestly. Do not accept decision calls you cannot answer.
+  bool ready = 1;
+
+  // module_name and module_version identify the implementation. The console shows them,
+  // and support uses them. Keep the version stable and in a semver-like form.
+  string module_name    = 2;
+  string module_version = 3;
+
+  // ruleset_id identifies the loaded ruleset. A content hash is ideal. The value MUST
+  // change whenever the effective ruleset changes.
+  string ruleset_id          = 4;
+  int64  ruleset_loaded_unix = 5;
+
+  ModuleCapabilities capabilities = 6;
+
+  // interface_version is the guardmodule.v1 revision you built against. Report the
+  // highest revision you fully implement. The Daemon refuses to use a Module whose
+  // revision it does not know (spec section 12).
+  uint32 interface_version = 7;
+
+  // degraded_reason is non-empty when the Module is ready but works with less capability
+  // than normal — a rule group that failed to compile, or a model that fell back to a
+  // smaller one. The console shows the value.
+  //
+  // Report it honestly. Do not answer with a partial ruleset and stay silent.
+  string degraded_reason = 8;
+}
+
+// ============================================================================
+// Admin surface — configuration and introspection
+// ============================================================================
+//
+// The Daemon is the only caller, over the same socket as the decision path. The console
+// never connects to the Module. The Daemon proxies each call, applies operator
+// authorization, and audits each change.
+//
+// The configuration surface describes itself. The console renders whatever settings you
+// declare, so you can add a setting without any change to AgentsGuard.
+
+enum SettingType {
+  SETTING_TYPE_UNSPECIFIED = 0;
+  SETTING_TYPE_STRING      = 1;
+  // The value is "true" or "false".
+  SETTING_TYPE_BOOL        = 2;
+  SETTING_TYPE_INT         = 3;
+  // allowed_values lists the permitted values.
+  SETTING_TYPE_ENUM        = 4;
+  // The value uses Go duration syntax, for example "500ms".
+  SETTING_TYPE_DURATION    = 5;
+}
+
+// ConfigSetting describes one tunable of the Module. Every value travels as text. The
+// type tells the console how to render and check it before the round trip.
+message ConfigSetting {
+  string      key            = 1;
+  string      value          = 2;
+  SettingType type           = 3;
+  string      label          = 4;
+  string      description    = 5;
+  repeated string allowed_values = 6;
+
+  // restart_required is true when a change takes effect only after the Daemon restarts
+  // the Module. The console says so rather than implying a live reload.
+  bool restart_required = 7;
+
+  // secret is true when the value must never be displayed after it is set. The console
+  // renders it write-only, with no reveal affordance.
+  bool secret = 8;
+}
+
+message GetConfigRequest {}
+
+message GetConfigResponse {
+  repeated ConfigSetting settings = 1;
+}
+
+message SetConfigRequest {
+  string key   = 1;
+  string value = 2;
+}
+
+message SetConfigResponse {
+  // setting is the stored setting after the write.
+  ConfigSetting setting = 1;
+
+  // warning is non-empty when the write succeeded but will not take effect as the
+  // operator probably expects.
+  string warning = 2;
+}
+
+// ============================================================================
+// Services
+// ============================================================================
+
+service GuardModule {
+  // Health reports readiness and capabilities. The Daemon polls it off the decision path,
+  // and at spawn until the Module reports ready.
+  //
+  // It MUST NOT wait for rule evaluation, and it MUST answer within 1 second. A Health
+  // call that hangs is how the Daemon detects a wedged Module.
+  //
+  // Every Module MUST implement it.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // CheckPrompt decides one user prompt. capabilities.check_prompt gates it.
+  rpc CheckPrompt(CheckPromptRequest) returns (PromptVerdict);
+
+  // CheckTranscript decides one completed turn. capabilities.check_transcript gates it.
+  //
+  // A DENY force-continues the turn and injects info.reason into the agent's next turn.
+  rpc CheckTranscript(CheckTranscriptRequest) returns (TranscriptVerdict);
+
+  // CheckToolInput decides one tool call before it runs. capabilities.check_tool_input
+  // gates it.
+  rpc CheckToolInput(CheckToolInputRequest) returns (ToolInputVerdict);
+
+  // CheckToolOutput decides whether tool output reaches the model.
+  // capabilities.check_tool_output gates it.
+  //
+  // Note the limit of this hook. The tool already ran. A deny stops the agent from
+  // reading the output. It is not prevention of the tool's own side effects. Do not
+  // describe it as such.
+  rpc CheckToolOutput(CheckToolOutputRequest) returns (ToolOutputVerdict);
+
+  // There is no egress RPC. The network is netguard.v1's surface — see the note above
+  // ToolInputVerdict.
+}
+
+service GuardModuleAdmin {
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+  rpc SetConfig(SetConfigRequest) returns (SetConfigResponse);
+}

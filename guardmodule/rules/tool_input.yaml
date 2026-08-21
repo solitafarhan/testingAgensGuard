@@ -1,0 +1,26 @@
+# Rules for CheckToolInput — evaluated against "tool_name: tool_input_json" before the
+# tool runs (model-outbound direction: what the agent is about to do).
+rules:
+  - id: dangerous.shell.rm-rf.001
+    pattern: 'rm\s+-rf\s+[/~]'
+    pattern_type: regex
+    action: deny
+    confidence: 0.95
+    rule_id: dangerous.shell.rm-rf
+    labels:
+      rule: destructive-shell-command
+      detector: tool_input
+    correction_message: >
+      the tool call runs a recursive force-delete against a root or home path
+
+  - id: dangerous.shell.pipe-to-shell.001
+    pattern: 'curl[^\n]{0,80}\|\s*(sh|bash)|wget[^\n]{0,80}\|\s*(sh|bash)'
+    pattern_type: regex
+    action: deny
+    confidence: 0.9
+    rule_id: dangerous.shell.pipe-to-shell
+    labels:
+      rule: pipe-to-shell
+      detector: tool_input
+    correction_message: >
+      the tool call downloads a remote script and pipes it directly into a shell

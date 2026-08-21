@@ -1,0 +1,16 @@
+# Global rules — evaluated against EVERY check type (prompt, tool_input, tool_output,
+# transcript), in addition to that check's own rules file. Use this file only for patterns
+# that are genuinely universal (e.g. secret-looking material appearing anywhere).
+rules:
+  - id: global.private-key-material.001
+    pattern: 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY'
+    pattern_type: regex
+    action: deny
+    confidence: 0.99
+    rule_id: global.private-key-material
+    labels:
+      rule: private-key-material
+      detector: global
+    correction_message: >
+      the content contains what looks like a private key block, which must not be
+      exposed, copied, or transmitted

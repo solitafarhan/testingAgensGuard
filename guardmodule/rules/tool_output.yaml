@@ -1,0 +1,15 @@
+# Rules for CheckToolOutput — evaluated against decoded tool output (model-inbound
+# direction: what a tool returned, before the model reads it). This is where prompt
+# injection actually arrives, per spec section 5.2.
+rules:
+  - id: inj.override.001
+    pattern: 'ignore (all )?previous instructions|disregard (all )?(prior|previous) instructions'
+    pattern_type: regex
+    action: deny
+    confidence: 0.97
+    rule_id: inj.override.001
+    labels:
+      rule: instruction-override
+      pattern: instruction-override
+      detector: tool_output
+    correction_message: "the fetched page contains an instruction-override pattern"

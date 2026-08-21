@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: guardmodule
+Version: 0.1.0
+Summary: guardmodule.v1 pattern-detection Module (mock-LLM test harness phase)
+Requires-Python: >=3.10
+Requires-Dist: grpcio>=1.60.0
+Requires-Dist: protobuf>=4.25.0
+Requires-Dist: PyYAML>=6.0
+Provides-Extra: dev
+Requires-Dist: grpcio-tools>=1.60.0; extra == "dev"
+Requires-Dist: pytest>=8.0.0; extra == "dev"

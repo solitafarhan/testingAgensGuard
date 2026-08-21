@@ -1,0 +1,42 @@
+# Rules for CheckPrompt — evaluated against GuardContext.prompt (the user's raw text).
+rules:
+  - id: cred.read.001
+    pattern: '\.aws/credentials|\.ssh/id_rsa|\.env\b|/etc/shadow'
+    pattern_type: regex
+    action: deny
+    confidence: 0.99
+    rule_id: cred.read.001
+    labels:
+      rule: credential-read
+      detector: prompt
+    correction_message: "the prompt asks the agent to read a credential file"
+
+  - id: cred.mention.001
+    pattern: 'api[ _-]?key|credential'
+    pattern_type: regex
+    action: allow_with_context
+    confidence: 0.42
+    rule_id: cred.mention
+    labels:
+      rule: credential-mention
+      detector: prompt
+    steering_context: >
+      This prompt refers to credentials. Do not read key material or secret files.
+      If the task needs a secret value, ask the operator instead. Before you act,
+      state your plan in one short paragraph.
+
+  - id: deployment.performance.001
+    pattern: 'deploy.{0,30}(slow|fail|optimi[sz]e|speed up)|speed up.{0,30}deploy'
+    pattern_type: regex
+    action: allow_with_context
+    confidence: 0.55
+    rule_id: deployment.performance
+    labels:
+      rule: deployment-performance-task
+      detector: prompt
+    steering_context: >
+      This prompt is about deployment performance. Do not disable, remove, or bypass
+      any security controls, audit logs, or monitoring to achieve a performance gain.
+      Before you act, state your plan in one short paragraph. If you believe a
+      security control is genuinely the cause, state your evidence and ask the
+      operator to decide rather than changing it yourself.
